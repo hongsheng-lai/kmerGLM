@@ -91,8 +91,46 @@ def preprocess_test_data(test_dataset, tokenizer):
     
     return tokenized_test, test_labels
 
+def minimizer_tokenizer(seq, k, w, tokenizer):
+    from minimizer import find_minimizers_custom
+    minimizers = find_minimizers_custom(seq, k=k, w=w, canonical=True)
+    canonical_seq = "".join(minimizers)
+    return tokenizer(canonical_seq, padding=True, truncation=True)
 
-def get_training_args(model_name: str, batch_size: int):
+def preprocess_train_data_with_minimizers(train_dataset, tokenizer, k, w, validation_split=0.05, random_state=42):
+    train_sequences = train_dataset['sequence']
+    train_labels = train_dataset['label']
+
+    train_sequences, validation_sequences, train_labels, validation_labels = train_test_split(
+        train_sequences, train_labels, test_size=validation_split, random_state=random_state)
+
+    ds_train = Dataset.from_dict({"data": train_sequences, "labels": train_labels})
+    ds_validation = Dataset.from_dict({"data": validation_sequences, "labels": validation_labels})
+
+    def tokenize_function(examples):
+        return minimizer_tokenizer(examples["data"], k, w, tokenizer)
+
+    tokenized_train = ds_train.map(tokenize_function, batched=False, remove_columns=["data"])
+    tokenized_validation = ds_validation.map(tokenize_function, batched=False, remove_columns=["data"])
+
+    return tokenized_train, tokenized_validation
+
+def preprocess_test_data_with_minimizers(test_dataset, tokenizer, k, w):
+    test_sequences = test_dataset['sequence']
+    test_labels = test_dataset['label']
+
+    ds_test = Dataset.from_dict({"data": test_sequences, "labels": test_labels})
+
+    def tokenize_function(examples):
+        return minimizer_tokenizer(examples["data"], k, w, tokenizer)
+
+    tokenized_test = ds_test.map(tokenize_function, batched=False, remove_columns=["data"])
+
+    return tokenized_test, test_labels
+
+
+def get_training_args(model_name: str, batch_size: int, num_labels: int):
+
     return TrainingArguments(
         output_dir=f"{model_name}-finetuned-NucleotideTransformer",
         remove_unused_columns=False,
@@ -104,12 +142,20 @@ def get_training_args(model_name: str, batch_size: int):
         per_device_eval_batch_size=64,
         num_train_epochs=2,
         logging_steps=100,
-        load_best_model_at_end=True,  # Keep the best model according to the evaluation
-        metric_for_best_model="f1_score",
+        load_best_model_at_end=True,  # Keep the best model according to thes evaluation
+        metric_for_best_model="f1_score" if num_labels == 2 else "mcc_score",
         label_names=["labels"],
         dataloader_drop_last=False,
         max_steps=1000,
     )
+
+# Define the metric for the evaluation
+def compute_metrics_mcc(eval_pred):
+    """Computes Matthews correlation coefficient (MCC score) for binary classification"""
+    predictions = np.argmax(eval_pred.predictions, axis=-1)
+    references = eval_pred.label_ids
+    r={'mcc_score': matthews_corrcoef(references, predictions)}
+    return r
 
 def compute_metrics(eval_pred):
     predictions = np.argmax(eval_pred.predictions, axis=-1)
@@ -123,7 +169,7 @@ def train_model(model, training_args, tokenized_train, tokenized_validation, tok
         train_dataset=tokenized_train,
         eval_dataset=tokenized_validation,
         tokenizer=tokenizer,
-        compute_metrics=compute_metrics,
+        compute_metrics=compute_metrics_mcc if training_args.metric_for_best_model == "mcc_score" else compute_metrics,
     )
     trainer.train()
     return trainer
@@ -139,9 +185,7 @@ def load_saved_model(model_name: str, device):
 
 def evaluate_model(trainer, tokenized_test, test_labels, model_name: str):
     test_results = trainer.predict(tokenized_test)
-    print(len(test_results.predictions))
     predictions = np.argmax(test_results.predictions, axis=-1)
-    print(len(predictions))
     cm = confusion_matrix(test_labels, predictions)
     
     plt.figure()
@@ -168,6 +212,20 @@ def plot_f1_score(trainer, model_name: str):
     plt.ylabel('Validation F1 score')
     plt.legend()
     plt.savefig(f"validation_f1_score_{model_name}.png")
+    plt.show()
+
+def plot_mcc_score(trainer, model_name: str):
+    curve_evaluation_mcc_score = [[a['step'], a['eval_mcc']] for a in trainer.state.log_history if 'eval_mcc' in a.keys()]
+    eval_mcc_score = [c[1] for c in curve_evaluation_mcc_score]
+    steps = [c[0] for c in curve_evaluation_mcc_score]
+    
+    plt.figure()
+    plt.plot(steps, eval_mcc_score, 'b', label='Validation MCC score')
+    plt.title(f'Validation MCC score for promoter prediction - {model_name}')
+    plt.xlabel('Number of training steps performed')
+    plt.ylabel('Validation MCC score')
+    plt.legend()
+    plt.savefig(f"validation_mcc_score_{model_name}.png")
     plt.show()
 
 # ---- New functions for masked inference ----
@@ -225,39 +283,10 @@ def evaluate_model_masked(trainer, tokenized_test, test_labels, model_name: str,
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
     plt.xlabel("Predicted")
     plt.ylabel("Actual")
-    plt.title(f"Confusion Matrix on Masked Test Set - {model_name}")
-    plt.savefig(f"confusion_matrix_masked_{model_name}.png")
+    plt.title(f"Confusion Matrix - {model_name} with Mask Ratio {mask_ratio}")
+    plt.savefig(f"confusion_matrix_masked_{model_name}_{str(int(mask_ratio*10))}.png")
     plt.show()
 
     print("Test Metrics (Masked Inference):")
     print(f"F1 Score: {test_results.metrics.get('test_f1_score', 'N/A')}")
     print(f"MCC: {matthews_corrcoef(test_labels, predictions)}")
-
-# ---- Example Usage ----
-if __name__ == "__main__":
-    device = get_device(gpu_id=0)  # Specify GPU ID
-    model_name = "baseline"
-    pretrained_model_name = "InstaDeepAI/nucleotide-transformer-500m-human-ref"
-    num_labels = 2
-    batch_size = 8
-
-    model = load_model(pretrained_model_name, num_labels, device)
-    tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name)
-
-    dataset_name = "promoter_all"
-    train_dataset = load_data(dataset_name, "train")
-    test_dataset = load_data(dataset_name, "test")
-
-    tokenized_train, tokenized_validation, tokenized_test, test_labels = preprocess_data(train_dataset, test_dataset, tokenizer)
-    training_args = get_training_args(model_name, batch_size)
-
-    trainer = train_model(model, training_args, tokenized_train, tokenized_validation, tokenizer)
-    save_model(trainer, model_name)
-    evaluate_model(trainer, tokenized_test, test_labels, model_name)
-    plot_f1_score(trainer, model_name)
-    
-    # Evaluate with masked test sequences (masking ~20% of each sequence)
-    evaluate_model_masked(trainer, tokenized_test, test_labels, model_name, tokenizer, mask_ratio=0.2)
-
-    # Reload saved model if needed
-    model, tokenizer = load_saved_model(model_name, device)
